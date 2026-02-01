@@ -24,11 +24,6 @@ Saves:
       Each image produces:
         <stem>_overlay_IA.png
         <stem>_overlay_IB.png
-
-IMPORTANT:
-  - Never crashes due to small images:
-    if an image is smaller than (patch + 2*rho), it is UPSCALED (aspect preserved).
-  - Iterates through ALL images in Train and Val (no skipping, no resampling to another image).
 """
 
 import random
@@ -57,21 +52,13 @@ class DataGenConfig:
     normalize: bool = True
     seed: Optional[int] = None
 
-
-# =========================
-# Paths (fixed + portable)
-# =========================
-THIS_FILE = Path(__file__).resolve()          # Phase2/Code/DataGen/HomographyDataGen.py
+THIS_FILE = Path(__file__).resolve()         # Phase2/Code/DataGen/HomographyDataGen.py
 CODE_DIR = THIS_FILE.parent                  # Phase2/Code/DataGen
 PHASE2_DIR = THIS_FILE.parents[2]            # Phase2
 
 DATA_DIR = PHASE2_DIR / "Data"               # dataset patches go here
 OVERLAY_DIR = CODE_DIR / "overlays"          # debug overlays go here
 
-
-# =========================
-# Utilities
-# =========================
 def _set_seed(seed: Optional[int]):
     if seed is None:
         return
@@ -80,10 +67,6 @@ def _set_seed(seed: Optional[int]):
 
 
 def extract_zip(data_root: Path):
-    """
-    Auto-extract Train.zip / Val.zip if Train/ and Val/ folders do not exist.
-    Expects zip files at: Phase2/Data/Train.zip and Phase2/Data/Val.zip
-    """
     for split in ["Train", "Val"]:
         split_dir = data_root / split
         zip_path = data_root / f"{split}.zip"
@@ -115,13 +98,11 @@ def read_image(path: Path, use_grayscale: bool) -> np.ndarray:
 
 def ensure_min_size(img: np.ndarray, patch_h: int, patch_w: int, rho: int) -> np.ndarray:
     """
-    Ensures image is big enough so sampling a patch of (patch_h, patch_w) with margin rho is ALWAYS possible.
+    Makes sure image is big enough so sampling a patch of (patch_h, patch_w) with margin rho is ALWAYS possible.
 
     Required:
       H >= patch_h + 2*rho + 1
       W >= patch_w + 2*rho + 1
-
-    If not, upscale (keep aspect ratio). Never downsizes.
     """
     H, W = img.shape[:2]
     minH = patch_h + 2 * rho + 1
@@ -210,9 +191,6 @@ def h4pt_label(CA: np.ndarray, CB: np.ndarray) -> np.ndarray:
     return (CB - CA).reshape(-1).astype(np.float32)
 
 
-# =========================
-# Overlay saving
-# =========================
 def _draw_quad(ax, pts, color, label=None):
     pts = np.array(pts, dtype=np.float32)
     poly = np.vstack([pts, pts[0]])
@@ -248,9 +226,6 @@ def _save_raw_patch(patch: np.ndarray, out_path: Path):
         cv2.imwrite(str(out_path), cv2.cvtColor(patch, cv2.COLOR_RGB2BGR))
 
 
-# =========================
-# Core generator (single image -> sample)
-# =========================
 def generate_one_pair_for_image(
     imgA: np.ndarray,
     cfg: DataGenConfig,
@@ -292,10 +267,6 @@ def generate_one_pair_for_image(
         "xy": np.array([x, y], dtype=np.int32),
     }
 
-
-# =========================
-# Saving (per image)
-# =========================
 def save_outputs_for_image(
     out: Dict[str, np.ndarray],
     img_stem: str,
@@ -331,10 +302,6 @@ def save_outputs_for_image(
         title="IB (warped): Patch A (blue) and Patch B (red, warped)"
     )
 
-
-# =========================
-# Full split processing
-# =========================
 def process_split(split_name: str, cfg: DataGenConfig):
     """
     Iterates through ALL images in a split and saves:
@@ -374,10 +341,6 @@ def process_split(split_name: str, cfg: DataGenConfig):
         if (idx + 1) % 100 == 0 or (idx + 1) == len(img_paths):
             print(f"[{split_name}] {idx+1}/{len(img_paths)} done")
 
-
-# =========================
-# CLI
-# =========================
 def _parse_args():
     import argparse
 
@@ -395,7 +358,7 @@ def _parse_args():
 def main():
     args = _parse_args()
 
-    # Ensure Train/Val are extracted inside Phase2/Data/
+    # Check and make sure Train/Val are extracted inside Phase2/Data/
     extract_zip(DATA_DIR)
 
     cfg = DataGenConfig(
