@@ -139,10 +139,10 @@ if __name__ == "__main__":
     print("Batch stacked:", batch["stacked"].shape)  # (B,2,H,W)
 
     # visualize one
-    PA = xtr["PA"].squeeze(0).numpy()
-    PB = xtr["PB"].squeeze(0).numpy()
-    plt.figure(figsize=(8,4))
-    plt.subplot(1,2,1); plt.imshow(PA, cmap="gray"); plt.title("PA"); plt.axis("off")
-    plt.subplot(1,2,2); plt.imshow(PB, cmap="gray"); plt.title("PB"); plt.axis("off")
-    plt.tight_layout()
-    plt.show()
+    # PA = xtr["PA"].squeeze(0).numpy()
+    # PB = xtr["PB"].squeeze(0).numpy()
+    # plt.figure(figsize=(8,4))
+    # plt.subplot(1,2,1); plt.imshow(PA, cmap="gray"); plt.title("PA"); plt.axis("off")
+    # plt.subplot(1,2,2); plt.imshow(PB, cmap="gray"); plt.title("PB"); plt.axis("off")
+    # plt.tight_layout()
+    # plt.show()
