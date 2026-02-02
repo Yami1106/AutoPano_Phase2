@@ -149,7 +149,6 @@ def parse_args():
     ap.add_argument("--align_corners", action="store_true", help="match warp.py default (recommended True)")
     ap.add_argument("--save_every", type=int, default=1)
 
-    # NEW:
     ap.add_argument("--rho", type=float, default=32.0, help="max corner perturbation used in dataset generation")
     ap.add_argument("--bound_mode", default="tanh", choices=["none", "clamp", "tanh"],
                     help="how to constrain predicted H4Pt to [-rho,rho]")
@@ -243,6 +242,6 @@ def main():
 
     print("Done.")
 
-
+#testing phase
 if __name__ == "__main__":
     main()
