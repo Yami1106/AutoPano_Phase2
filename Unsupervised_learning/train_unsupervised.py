@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """
-RBE/CS Fall 2022: Classical and Deep Learning Approaches for
-Geometric Computer Vision
-Project 1: MyAutoPano: Phase 2
-
 Unsupervised Learning - Training (NO DataLoader version)
 
-Dataset layout (as in your screenshot):
+Dataset layout:
   Phase2/Data/patch_train/
     1_PA.png
     1_PB.png
     1_meta.npz
-    1_H4Pt.npy   (optional; not used for unsup loss)
-    2_PA.png ...
+  Phase2/Data/patch_val/
+    ...
 
-Train loop (unsupervised):
+Train loop:
   stacked(PA,PB) -> HomographyNet -> H4Pt_hat -> TensorDLT -> H_hat
   -> warp(PA) -> masked photometric L1 loss vs PB
 """
@@ -34,8 +30,14 @@ from torch.utils.tensorboard import SummaryWriter
 
 from Unsupervised_learning.model import Homographynet
 from Unsupervised_learning.tensordlt import tensor_dlt
-from Unsupervised_learning.warp import apply_warp
+from Unsupervised_learning.warp import apply_warp_with_mask
 from Unsupervised_learning.loss import PhotometricLoss
+
+
+# ----------------------------
+# Speed knobs (safe)
+# ----------------------------
+torch.backends.cudnn.benchmark = True
 
 
 # ----------------------------
@@ -44,11 +46,9 @@ from Unsupervised_learning.loss import PhotometricLoss
 
 def get_default_paths():
     this = Path(__file__).resolve()
-    # .../Phase2/Code/Unsupervised_learning/train_unsupervised.py
     phase2 = this.parents[2]  # Phase2/
     data_dir = phase2 / "Data"
 
-    # Your folder names
     train_dir = data_dir / "patch_train"
     val_dir = data_dir / "patch_val"
     if not val_dir.exists():
@@ -63,21 +63,25 @@ def get_default_paths():
     return data_dir, train_dir, val_dir, ckpt_dir, logs_dir
 
 
-def read_gray01_png(path: str) -> np.ndarray:
-    """
-    Read PNG as grayscale float32 in [0,1], shape (H,W).
-    """
-    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise FileNotFoundError(f"Could not read image: {path}")
-    return img.astype(np.float32) / 255.0
+# --- Simple RAM caches to kill disk bottleneck ---
+_IMG_CACHE = {}   # path -> uint8 (H,W)
+_META_CACHE = {}  # path -> float32 (4,2)
+
+
+def read_gray_uint8_cached(path: str) -> np.ndarray:
+    if path not in _IMG_CACHE:
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            raise FileNotFoundError(f"Could not read image: {path}")
+        _IMG_CACHE[path] = img
+    return _IMG_CACHE[path]
+
+
+def read_gray01_cached(path: str) -> np.ndarray:
+    return read_gray_uint8_cached(path).astype(np.float32) / 255.0
 
 
 def extract_CA_from_meta(meta_path: str) -> np.ndarray:
-    """
-    meta.npz should contain patch corner coordinates CA with shape (4,2).
-    We try common key names. If none match, we raise and print keys.
-    """
     meta = np.load(meta_path, allow_pickle=True)
     keys = list(meta.keys())
 
@@ -94,7 +98,6 @@ def extract_CA_from_meta(meta_path: str) -> np.ndarray:
             CA = np.array(meta[k], dtype=np.float32).reshape(4, 2)
             return CA
 
-    # Heuristic: any array that can reshape to (4,2)
     for k in keys:
         arr = np.array(meta[k])
         if arr.size == 8:
@@ -111,11 +114,13 @@ def extract_CA_from_meta(meta_path: str) -> np.ndarray:
     )
 
 
+def extract_CA_cached(meta_path: str) -> np.ndarray:
+    if meta_path not in _META_CACHE:
+        _META_CACHE[meta_path] = extract_CA_from_meta(meta_path)
+    return _META_CACHE[meta_path]
+
+
 def to_torch_chw(x: np.ndarray, device: torch.device) -> torch.Tensor:
-    """
-    Convert numpy image to torch float tensor CHW.
-    If x is (H,W) -> (1,H,W)
-    """
     x = x.astype(np.float32)
     if x.ndim == 2:
         x = x[None, :, :]
@@ -127,13 +132,6 @@ def to_torch_chw(x: np.ndarray, device: torch.device) -> torch.Tensor:
 
 
 def bound_h4pt(h4pt_hat: torch.Tensor, rho: float, mode: str) -> torch.Tensor:
-    """
-    h4pt_hat: (B,8)
-    mode:
-      - none : no bound
-      - clamp: clamp to [-rho, rho]
-      - tanh : rho*tanh(pred)
-    """
     if mode == "none":
         return h4pt_hat
     if mode == "clamp":
@@ -143,17 +141,21 @@ def bound_h4pt(h4pt_hat: torch.Tensor, rho: float, mode: str) -> torch.Tensor:
     raise ValueError("bound_mode must be one of: none, clamp, tanh")
 
 
+def normalize_patch(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Per-patch normalization improves convergence when brightness/exposure differs.
+    x: (B,1,H,W)
+    """
+    mean = x.mean(dim=(2, 3), keepdim=True)
+    std = x.std(dim=(2, 3), keepdim=True)
+    return (x - mean) / (std + eps)
+
+
 # ----------------------------
-# Sample discovery for YOUR dataset layout
+# Sample discovery
 # ----------------------------
 
 def list_samples(patch_dir: Path):
-    """
-    Collect samples from a folder containing:
-      {id}_PA.png
-      {id}_PB.png
-      {id}_meta.npz
-    """
     patch_dir = str(patch_dir)
     pa_files = sorted(glob.glob(os.path.join(patch_dir, "*_PA.png")))
 
@@ -164,7 +166,6 @@ def list_samples(patch_dir: Path):
         meta = base + "_meta.npz"
         if os.path.exists(pb) and os.path.exists(meta):
             samples.append({"PA_png": pa, "PB_png": pb, "meta_npz": meta})
-
     return samples
 
 
@@ -173,21 +174,14 @@ def list_samples(patch_dir: Path):
 # ----------------------------
 
 def GenerateBatch(samples, MiniBatchSize, device):
-    """
-    Returns:
-      stacked_batch: (B,2,H,W)
-      PA_batch:      (B,1,H,W)
-      PB_batch:      (B,1,H,W)
-      CA_batch:      (B,4,2)
-    """
     stacked_list, pa_list, pb_list, ca_list = [], [], [], []
 
     for _ in range(MiniBatchSize):
         s = random.choice(samples)
 
-        PA = read_gray01_png(s["PA_png"])                 # (H,W)
-        PB = read_gray01_png(s["PB_png"])                 # (H,W)
-        CA = extract_CA_from_meta(s["meta_npz"])          # (4,2)
+        PA = read_gray01_cached(s["PA_png"])
+        PB = read_gray01_cached(s["PB_png"])
+        CA = extract_CA_cached(s["meta_npz"])
 
         if PA.shape != PB.shape:
             raise ValueError(f"PA and PB sizes differ: {s['PA_png']} vs {s['PB_png']}")
@@ -203,42 +197,49 @@ def GenerateBatch(samples, MiniBatchSize, device):
         pb_list.append(PB_t)
         ca_list.append(CA_t)
 
-    stacked_batch = torch.stack(stacked_list, dim=0)
-    PA_batch = torch.stack(pa_list, dim=0)
-    PB_batch = torch.stack(pb_list, dim=0)
-    CA_batch = torch.stack(ca_list, dim=0)
+    stacked_batch = torch.stack(stacked_list, dim=0)  # (B,2,H,W)
+    PA_batch = torch.stack(pa_list, dim=0)            # (B,1,H,W)
+    PB_batch = torch.stack(pb_list, dim=0)            # (B,1,H,W)
+    CA_batch = torch.stack(ca_list, dim=0)            # (B,4,2)
 
     return stacked_batch, PA_batch, PB_batch, CA_batch
 
 
 # ----------------------------
-# Train / Val loops
+# Val loop
 # ----------------------------
 
 @torch.no_grad()
 def RunValidation(model, samples, MiniBatchSize, NumIterations, loss_fn,
-                  device, rho, bound_mode, mask_thresh, align_corners):
+                  device, rho, bound_mode, align_corners, use_patch_norm):
     model.eval()
     total = 0.0
 
     for _ in range(NumIterations):
         stacked, PA, PB, CA = GenerateBatch(samples, MiniBatchSize, device)
 
-        h4pt_hat = model(stacked)                 # (B,8)
-        h4pt_hat = bound_h4pt(h4pt_hat, rho, bound_mode)
+        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            h4pt_hat = model(stacked)
+            h4pt_hat = bound_h4pt(h4pt_hat, rho, bound_mode)
 
-        H_hat = tensor_dlt(CA, h4pt_hat)          # (B,3,3)
-        PA_warp = apply_warp(PA, H_hat, align_corners=align_corners)
+            H_hat = tensor_dlt(CA, h4pt_hat)
+            PA_warp, valid_mask = apply_warp_with_mask(PA, H_hat, align_corners=align_corners)
 
-        ones = torch.ones_like(PA)
-        ones_warp = apply_warp(ones, H_hat, align_corners=align_corners)
-        valid_mask = (ones_warp > mask_thresh).float()
+            if use_patch_norm:
+                PA_warp_n = normalize_patch(PA_warp)
+                PB_n = normalize_patch(PB)
+                loss = loss_fn(PA_warp_n, PB_n, valid_mask)
+            else:
+                loss = loss_fn(PA_warp, PB, valid_mask)
 
-        loss = loss_fn(PA_warp, PB, valid_mask)
         total += float(loss.item())
 
     return total / max(NumIterations, 1)
 
+
+# ----------------------------
+# Checkpoint helpers
+# ----------------------------
 
 def FindLatestModel(CheckPointPath):
     ckpts = sorted(glob.glob(os.path.join(CheckPointPath, "*model.ckpt")))
@@ -259,6 +260,10 @@ def PrettyPrint(NumEpochs, MiniBatchSize, NumTrainSamples, NumValSamples, Latest
         print("Loading latest checkpoint with the name " + LatestFile)
 
 
+# ----------------------------
+# Train
+# ----------------------------
+
 def TrainOperation(
     TrainSamples,
     ValSamples,
@@ -272,14 +277,19 @@ def TrainOperation(
     LR,
     Rho,
     BoundMode,
-    MaskThresh,
-    AlignCorners
+    AlignCorners,
+    LogEvery,
+    ValEvery,
+    UsePatchNorm,
+    WeightDecay
 ):
     model = Homographynet(in_channels=2).to(Device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WeightDecay)
     loss_fn = PhotometricLoss()
 
     writer = SummaryWriter(LogsPath)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=(Device.type == "cuda"))
 
     start_epoch = 0
     global_step = 0
@@ -292,13 +302,14 @@ def TrainOperation(
         start_epoch = int(ckpt.get("epoch", 0))
         print("Loaded checkpoint:", LatestFile, "start_epoch:", start_epoch)
 
+    # You are printing "Number of Training Samples 50000" etc, but that is *logical* count.
+    # Actual iteration count is computed here:
     train_iters_per_epoch = max(len(TrainSamples) // MiniBatchSize, 1)
     val_iters = max(len(ValSamples) // MiniBatchSize, 1) if len(ValSamples) > 0 else 0
 
     for epoch in range(start_epoch, NumEpochs):
         t0 = time.time()
         model.train()
-
         running = 0.0
 
         for it in range(train_iters_per_epoch):
@@ -306,57 +317,74 @@ def TrainOperation(
 
             optimizer.zero_grad(set_to_none=True)
 
-            h4pt_hat = model(stacked)  # (B,8)
-            h4pt_hat = bound_h4pt(h4pt_hat, Rho, BoundMode)
+            with torch.cuda.amp.autocast(enabled=(Device.type == "cuda")):
+                h4pt_hat = model(stacked)
+                h4pt_hat = bound_h4pt(h4pt_hat, Rho, BoundMode)
 
-            H_hat = tensor_dlt(CA, h4pt_hat)  # (B,3,3)
-            PA_warp = apply_warp(PA, H_hat, align_corners=AlignCorners)
+                H_hat = tensor_dlt(CA, h4pt_hat)
+                PA_warp, valid_mask = apply_warp_with_mask(PA, H_hat, align_corners=AlignCorners)
 
-            ones = torch.ones_like(PA)
-            ones_warp = apply_warp(ones, H_hat, align_corners=AlignCorners)
-            valid_mask = (ones_warp > MaskThresh).float()
+                if UsePatchNorm:
+                    PA_warp_n = normalize_patch(PA_warp)
+                    PB_n = normalize_patch(PB)
+                    loss = loss_fn(PA_warp_n, PB_n, valid_mask)
+                else:
+                    loss = loss_fn(PA_warp, PB, valid_mask)
 
-            loss = loss_fn(PA_warp, PB, valid_mask)
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-            running += float(loss.item())
+            loss_val = float(loss.item())
+            running += loss_val
             global_step += 1
 
-            writer.add_scalar("LossEveryIter/train", float(loss.item()), global_step)
-            writer.flush()
+            # TensorBoard (NO flush every iter)
+            if global_step % LogEvery == 0:
+                writer.add_scalar("LossEveryIter/train", loss_val, global_step)
+                writer.flush()
 
-            if SaveCheckPoint > 0 and (it % SaveCheckPoint == 0):
+            # Optional console heartbeat (helps you see it's not "stuck")
+            if it % max(50, (train_iters_per_epoch // 10)) == 0:
+                print(f"  [epoch {epoch+1:02d}] it {it:05d}/{train_iters_per_epoch:05d} loss {loss_val:.6f}")
+
+            # checkpoint every N iters (avoid it==0)
+            if SaveCheckPoint > 0 and (it % SaveCheckPoint == 0) and it != 0:
                 save_name = os.path.join(CheckPointPath, f"{epoch}a{it}model.ckpt")
                 torch.save(
                     {
                         "epoch": epoch,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
-                        "loss": float(loss.item()),
+                        "loss": loss_val,
                     },
                     save_name
                 )
 
         train_loss = running / max(train_iters_per_epoch, 1)
 
-        if val_iters > 0:
+        # Validation (optionally not every epoch to save time)
+        if (epoch + 1) % ValEvery == 0 and val_iters > 0:
             val_loss = RunValidation(
                 model, ValSamples, MiniBatchSize, val_iters, loss_fn,
-                Device, Rho, BoundMode, MaskThresh, AlignCorners
+                Device, Rho, BoundMode, AlignCorners, UsePatchNorm
             )
         else:
-            val_loss = float("inf")
+            val_loss = float("inf") if val_iters > 0 else float("inf")
 
+        # Epoch scalars
         writer.add_scalar("LossEveryEpoch/train", train_loss, epoch)
-        if val_iters > 0:
+        if val_iters > 0 and (epoch + 1) % ValEvery == 0:
             writer.add_scalar("LossEveryEpoch/val", val_loss, epoch)
         writer.flush()
 
-        # Clean output: only epoch and losses
-        print(f"Epoch {epoch+1:03d}/{NumEpochs:03d} | train_loss: {train_loss:.6f} | val_loss: {val_loss:.6f}")
+        dt = time.time() - t0
+        if val_iters > 0 and (epoch + 1) % ValEvery == 0:
+            print(f"Epoch {epoch+1:03d}/{NumEpochs:03d} | train_loss: {train_loss:.6f} | val_loss: {val_loss:.6f} | time: {dt:.1f}s")
+        else:
+            print(f"Epoch {epoch+1:03d}/{NumEpochs:03d} | train_loss: {train_loss:.6f} | val_loss: (skipped) | time: {dt:.1f}s")
 
-        # Save every epoch (silently)
+        # Save every epoch (one file)
         save_name = os.path.join(CheckPointPath, f"{epoch}model.ckpt")
         torch.save(
             {
@@ -369,7 +397,7 @@ def TrainOperation(
             save_name
         )
 
-        # Save best (silently)
+        # Save best
         if val_loss < best_val:
             best_val = val_loss
             best_name = os.path.join(CheckPointPath, "best.pt")
@@ -383,6 +411,7 @@ def TrainOperation(
                 },
                 best_name
             )
+            print("  ✓ saved best.pt")
 
 
 def main():
@@ -395,16 +424,27 @@ def main():
     parser.add_argument("--CheckPointPath", default=str(ckpt_dir), help="Path to save checkpoints")
     parser.add_argument("--LogsPath", default=str(logs_dir), help="Path to save Tensorboard logs")
 
-    parser.add_argument("--NumEpochs", type=int, default=50)
-    parser.add_argument("--MiniBatchSize", type=int, default=128, help="Start with 8/16; 128 can be too big for warps")
-    parser.add_argument("--SaveCheckPoint", type=int, default=50, help="save every N iters")
+    parser.add_argument("--NumEpochs", type=int, default=10)
+    parser.add_argument("--MiniBatchSize", type=int, default=32)
+
+    # Reduce checkpoint stalls by default
+    parser.add_argument("--SaveCheckPoint", type=int, default=500, help="save every N iters (0 disables)")
     parser.add_argument("--LoadCheckPoint", type=int, default=0)
 
-    parser.add_argument("--lr", type=float, default=0.0001)
+    # IMPORTANT: better LR default
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-6)
+
     parser.add_argument("--rho", type=float, default=32.0)
     parser.add_argument("--bound_mode", default="tanh", choices=["none", "clamp", "tanh"])
-    parser.add_argument("--mask_thresh", type=float, default=0.9)
     parser.add_argument("--align_corners", action="store_true")
+
+    # Logging + val frequency
+    parser.add_argument("--log_every", type=int, default=50, help="tensorboard scalar every N steps")
+    parser.add_argument("--val_every", type=int, default=1, help="run val every N epochs (increase to speed up)")
+
+    # Helps convergence
+    parser.add_argument("--use_patch_norm", action="store_true", help="normalize PA_warp/PB per patch before loss")
 
     args = parser.parse_args()
 
@@ -423,9 +463,10 @@ def main():
 
     PrettyPrint(args.NumEpochs, args.MiniBatchSize, len(train_samples), len(val_samples), latest)
     print("Device:", device)
-    print("rho:", args.rho, "bound_mode:", args.bound_mode, "mask_thresh:", args.mask_thresh, "align_corners:", args.align_corners)
+    print("rho:", args.rho, "bound_mode:", args.bound_mode, "align_corners:", args.align_corners)
     print("TrainDir:", train_dir)
     print("ValDir:", val_dir)
+    print("LR:", args.lr, "weight_decay:", args.weight_decay, "use_patch_norm:", args.use_patch_norm)
 
     if len(train_samples) == 0:
         raise RuntimeError(
@@ -446,8 +487,11 @@ def main():
         LR=args.lr,
         Rho=args.rho,
         BoundMode=args.bound_mode,
-        MaskThresh=args.mask_thresh,
         AlignCorners=args.align_corners,
+        LogEvery=max(1, args.log_every),
+        ValEvery=max(1, args.val_every),
+        UsePatchNorm=args.use_patch_norm,
+        WeightDecay=args.weight_decay,
     )
 
 

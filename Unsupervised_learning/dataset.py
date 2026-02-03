@@ -106,8 +106,8 @@ class UnsupervisedDataset(Dataset):
 
         return sample
 
+
 if __name__ == "__main__":
-    from torch.utils.data import DataLoader
     import matplotlib.pyplot as plt
 
     this = Path(__file__).resolve()
@@ -133,16 +133,28 @@ if __name__ == "__main__":
     print("Train sample stacked:", xtr["stacked"].shape, "stem:", xtr["stem"])
     print("Val sample stacked:", xva["stacked"].shape, "stem:", xva["stem"])
 
-    # loader check
-    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, num_workers=2, pin_memory=True)
-    batch = next(iter(train_loader))
-    print("Batch stacked:", batch["stacked"].shape)  # (B,2,H,W)
+    # Manual batch creation (NO DataLoader)
+    print("\n=== Manual Batch Test ===")
+    batch_size = 8
+    batch_samples = [train_ds[i] for i in range(batch_size)]
+    
+    # Stack manually
+    stacked_batch = torch.stack([s["stacked"] for s in batch_samples])
+    PA_batch = torch.stack([s["PA"] for s in batch_samples])
+    PB_batch = torch.stack([s["PB"] for s in batch_samples])
+    CA_batch = torch.stack([s["CA"] for s in batch_samples])
+    
+    print(f"Batch stacked: {stacked_batch.shape}")  # (B,2,H,W)
+    print(f"Batch PA: {PA_batch.shape}")  # (B,1,H,W)
+    print(f"Batch PB: {PB_batch.shape}")  # (B,1,H,W)
+    print(f"Batch CA: {CA_batch.shape}")  # (B,4,2)
 
     # visualize one
-    # PA = xtr["PA"].squeeze(0).numpy()
-    # PB = xtr["PB"].squeeze(0).numpy()
-    # plt.figure(figsize=(8,4))
-    # plt.subplot(1,2,1); plt.imshow(PA, cmap="gray"); plt.title("PA"); plt.axis("off")
-    # plt.subplot(1,2,2); plt.imshow(PB, cmap="gray"); plt.title("PB"); plt.axis("off")
-    # plt.tight_layout()
-    # plt.show()
+    PA = xtr["PA"].squeeze(0).numpy()
+    PB = xtr["PB"].squeeze(0).numpy()
+    plt.figure(figsize=(8,4))
+    plt.subplot(1,2,1); plt.imshow(PA, cmap="gray"); plt.title("PA"); plt.axis("off")
+    plt.subplot(1,2,2); plt.imshow(PB, cmap="gray"); plt.title("PB"); plt.axis("off")
+    plt.tight_layout()
+    plt.savefig("dataset_test.png")
+    print("\nSaved visualization to dataset_test.png")
