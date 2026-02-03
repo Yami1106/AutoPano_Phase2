@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 '''
-Unsupervised Learning - Step 5.1 (FIXED)
+Unsupervised Learning - Step 5.1
 
 Masked Photometric Loss
 '''
