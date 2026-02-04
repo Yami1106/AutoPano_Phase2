@@ -76,7 +76,9 @@ def tensor_dlt(CA: torch.Tensor, h4pt: torch.Tensor) -> torch.Tensor:
 
     A, b = build_homography(CA, CB)
 
-    h = torch.linalg.solve(A, b).squeeze(-1)
+    #h = torch.linalg.solve(A, b).squeeze(-1)
+    h = torch.linalg.lstsq(A, b).solution.squeeze(-1)
+
 
     h11, h12, h13 = h[:, 0], h[:, 1], h[:, 2]
     h21, h22, h23 = h[:, 3], h[:, 4], h[:, 5]

@@ -1,18 +1,7 @@
 #!/usr/bin/env python3
 """
-Unsupervised Learning - Training (NO DataLoader version)
-
-Dataset layout:
-  Phase2/Data/patch_train/
-    1_PA.png
-    1_PB.png
-    1_meta.npz
-  Phase2/Data/patch_val/
-    ...
-
-Train loop:
-  stacked(PA,PB) -> HomographyNet -> H4Pt_hat -> TensorDLT -> H_hat
-  -> warp(PA) -> masked photometric L1 loss vs PB
+Unsupervised Learning - Training Script (NO DataLoader)
+FIXED VERSION - Stable, clean, no experimental features
 """
 
 import os
@@ -24,20 +13,13 @@ from pathlib import Path
 
 import numpy as np
 import cv2
-
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from Unsupervised_learning.model import Homographynet
 from Unsupervised_learning.tensordlt import tensor_dlt
-from Unsupervised_learning.warp import apply_warp_with_mask
+from Unsupervised_learning.warp import apply_warp
 from Unsupervised_learning.loss import PhotometricLoss
-
-
-# ----------------------------
-# Speed knobs (safe)
-# ----------------------------
-torch.backends.cudnn.benchmark = True
 
 
 # ----------------------------
@@ -46,7 +28,7 @@ torch.backends.cudnn.benchmark = True
 
 def get_default_paths():
     this = Path(__file__).resolve()
-    phase2 = this.parents[2]  # Phase2/
+    phase2 = this.parents[2]
     data_dir = phase2 / "Data"
 
     train_dir = data_dir / "patch_train"
@@ -63,25 +45,16 @@ def get_default_paths():
     return data_dir, train_dir, val_dir, ckpt_dir, logs_dir
 
 
-# --- Simple RAM caches to kill disk bottleneck ---
-_IMG_CACHE = {}   # path -> uint8 (H,W)
-_META_CACHE = {}  # path -> float32 (4,2)
-
-
-def read_gray_uint8_cached(path: str) -> np.ndarray:
-    if path not in _IMG_CACHE:
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise FileNotFoundError(f"Could not read image: {path}")
-        _IMG_CACHE[path] = img
-    return _IMG_CACHE[path]
-
-
-def read_gray01_cached(path: str) -> np.ndarray:
-    return read_gray_uint8_cached(path).astype(np.float32) / 255.0
+def read_gray01_png(path: str) -> np.ndarray:
+    """Read PNG as grayscale float32 in [0,1], shape (H,W)."""
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(f"Could not read image: {path}")
+    return img.astype(np.float32) / 255.0
 
 
 def extract_CA_from_meta(meta_path: str) -> np.ndarray:
+    """Extract CA corners from meta.npz file."""
     meta = np.load(meta_path, allow_pickle=True)
     keys = list(meta.keys())
 
@@ -98,6 +71,7 @@ def extract_CA_from_meta(meta_path: str) -> np.ndarray:
             CA = np.array(meta[k], dtype=np.float32).reshape(4, 2)
             return CA
 
+    # Heuristic: any array that can reshape to (4,2)
     for k in keys:
         arr = np.array(meta[k])
         if arr.size == 8:
@@ -108,19 +82,12 @@ def extract_CA_from_meta(meta_path: str) -> np.ndarray:
 
     raise KeyError(
         f"Could not find CA (4x2 corners) inside meta file: {meta_path}\n"
-        f"Available keys: {keys}\n"
-        f"Fix: store CA in meta.npz under key 'CA' (recommended), "
-        f"or update extract_CA_from_meta() with your key."
+        f"Available keys: {keys}"
     )
 
 
-def extract_CA_cached(meta_path: str) -> np.ndarray:
-    if meta_path not in _META_CACHE:
-        _META_CACHE[meta_path] = extract_CA_from_meta(meta_path)
-    return _META_CACHE[meta_path]
-
-
 def to_torch_chw(x: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Convert numpy image to torch float tensor CHW."""
     x = x.astype(np.float32)
     if x.ndim == 2:
         x = x[None, :, :]
@@ -132,6 +99,7 @@ def to_torch_chw(x: np.ndarray, device: torch.device) -> torch.Tensor:
 
 
 def bound_h4pt(h4pt_hat: torch.Tensor, rho: float, mode: str) -> torch.Tensor:
+    """Bound h4pt predictions."""
     if mode == "none":
         return h4pt_hat
     if mode == "clamp":
@@ -141,21 +109,12 @@ def bound_h4pt(h4pt_hat: torch.Tensor, rho: float, mode: str) -> torch.Tensor:
     raise ValueError("bound_mode must be one of: none, clamp, tanh")
 
 
-def normalize_patch(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """
-    Per-patch normalization improves convergence when brightness/exposure differs.
-    x: (B,1,H,W)
-    """
-    mean = x.mean(dim=(2, 3), keepdim=True)
-    std = x.std(dim=(2, 3), keepdim=True)
-    return (x - mean) / (std + eps)
-
-
 # ----------------------------
-# Sample discovery
+# Sample discovery and caching
 # ----------------------------
 
 def list_samples(patch_dir: Path):
+    """Collect samples from a folder."""
     patch_dir = str(patch_dir)
     pa_files = sorted(glob.glob(os.path.join(patch_dir, "*_PA.png")))
 
@@ -166,80 +125,97 @@ def list_samples(patch_dir: Path):
         meta = base + "_meta.npz"
         if os.path.exists(pb) and os.path.exists(meta):
             samples.append({"PA_png": pa, "PB_png": pb, "meta_npz": meta})
+
     return samples
 
 
+def preload_samples(samples, device, max_cache=10000):
+    """
+    Pre-load samples into memory to avoid repeated disk I/O.
+    """
+    print(f"[INFO] Pre-loading up to {max_cache} samples into memory...")
+    cached_samples = []
+    
+    for i, s in enumerate(samples[:max_cache]):
+        if (i + 1) % 1000 == 0:
+            print(f"  Loaded {i+1}/{min(len(samples), max_cache)}...")
+        
+        try:
+            PA = read_gray01_png(s["PA_png"])
+            PB = read_gray01_png(s["PB_png"])
+            CA = extract_CA_from_meta(s["meta_npz"])
+            
+            # Pre-convert to tensors and move to device
+            PA_t = to_torch_chw(PA, device)
+            PB_t = to_torch_chw(PB, device)
+            stacked_t = torch.cat([PA_t, PB_t], dim=0)
+            CA_t = torch.from_numpy(CA.astype(np.float32)).to(device)
+            
+            cached_samples.append({
+                "stacked": stacked_t,
+                "PA": PA_t,
+                "PB": PB_t,
+                "CA": CA_t,
+            })
+        except Exception as e:
+            print(f"  Warning: Failed to load {s['PA_png']}: {e}")
+            continue
+    
+    print(f"[INFO] Loaded {len(cached_samples)} samples into memory")
+    return cached_samples
+
+
 # ----------------------------
-# Batch generation (NO DataLoader)
+# Batch generation
 # ----------------------------
 
-def GenerateBatch(samples, MiniBatchSize, device):
-    stacked_list, pa_list, pb_list, ca_list = [], [], [], []
-
-    for _ in range(MiniBatchSize):
-        s = random.choice(samples)
-
-        PA = read_gray01_cached(s["PA_png"])
-        PB = read_gray01_cached(s["PB_png"])
-        CA = extract_CA_cached(s["meta_npz"])
-
-        if PA.shape != PB.shape:
-            raise ValueError(f"PA and PB sizes differ: {s['PA_png']} vs {s['PB_png']}")
-
-        PA_t = to_torch_chw(PA, device)                   # (1,H,W)
-        PB_t = to_torch_chw(PB, device)                   # (1,H,W)
-        stacked_t = torch.cat([PA_t, PB_t], dim=0)        # (2,H,W)
-
-        CA_t = torch.from_numpy(CA.astype(np.float32)).to(device)  # (4,2)
-
-        stacked_list.append(stacked_t)
-        pa_list.append(PA_t)
-        pb_list.append(PB_t)
-        ca_list.append(CA_t)
-
-    stacked_batch = torch.stack(stacked_list, dim=0)  # (B,2,H,W)
-    PA_batch = torch.stack(pa_list, dim=0)            # (B,1,H,W)
-    PB_batch = torch.stack(pb_list, dim=0)            # (B,1,H,W)
-    CA_batch = torch.stack(ca_list, dim=0)            # (B,4,2)
-
+def GenerateBatch(cached_samples, MiniBatchSize):
+    """Generate batch from pre-loaded cached samples."""
+    batch_samples = random.choices(cached_samples, k=MiniBatchSize)
+    
+    stacked_list = [s["stacked"] for s in batch_samples]
+    pa_list = [s["PA"] for s in batch_samples]
+    pb_list = [s["PB"] for s in batch_samples]
+    ca_list = [s["CA"] for s in batch_samples]
+    
+    stacked_batch = torch.stack(stacked_list, dim=0)
+    PA_batch = torch.stack(pa_list, dim=0)
+    PB_batch = torch.stack(pb_list, dim=0)
+    CA_batch = torch.stack(ca_list, dim=0)
+    
     return stacked_batch, PA_batch, PB_batch, CA_batch
 
 
 # ----------------------------
-# Val loop
+# Train / Val loops
 # ----------------------------
 
 @torch.no_grad()
-def RunValidation(model, samples, MiniBatchSize, NumIterations, loss_fn,
-                  device, rho, bound_mode, align_corners, use_patch_norm):
+def RunValidation(model, cached_samples, MiniBatchSize, NumIterations, loss_fn,
+                  rho, bound_mode, mask_thresh, align_corners):
     model.eval()
     total = 0.0
+    num_batches = 0
 
     for _ in range(NumIterations):
-        stacked, PA, PB, CA = GenerateBatch(samples, MiniBatchSize, device)
+        stacked, PA, PB, CA = GenerateBatch(cached_samples, MiniBatchSize)
 
-        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-            h4pt_hat = model(stacked)
-            h4pt_hat = bound_h4pt(h4pt_hat, rho, bound_mode)
+        h4pt_hat = model(stacked)
+        h4pt_hat = bound_h4pt(h4pt_hat, rho, bound_mode)
 
-            H_hat = tensor_dlt(CA, h4pt_hat)
-            PA_warp, valid_mask = apply_warp_with_mask(PA, H_hat, align_corners=align_corners)
+        H_hat = tensor_dlt(CA, h4pt_hat)
+        PA_warp = apply_warp(PA, H_hat, align_corners=align_corners)
 
-            if use_patch_norm:
-                PA_warp_n = normalize_patch(PA_warp)
-                PB_n = normalize_patch(PB)
-                loss = loss_fn(PA_warp_n, PB_n, valid_mask)
-            else:
-                loss = loss_fn(PA_warp, PB, valid_mask)
+        ones = torch.ones_like(PA)
+        ones_warp = apply_warp(ones, H_hat, align_corners=align_corners)
+        valid_mask = (ones_warp > mask_thresh).float()
 
+        loss = loss_fn(PA_warp, PB, valid_mask)
         total += float(loss.item())
+        num_batches += 1
 
-    return total / max(NumIterations, 1)
+    return total / max(num_batches, 1)
 
-
-# ----------------------------
-# Checkpoint helpers
-# ----------------------------
 
 def FindLatestModel(CheckPointPath):
     ckpts = sorted(glob.glob(os.path.join(CheckPointPath, "*model.ckpt")))
@@ -260,16 +236,11 @@ def PrettyPrint(NumEpochs, MiniBatchSize, NumTrainSamples, NumValSamples, Latest
         print("Loading latest checkpoint with the name " + LatestFile)
 
 
-# ----------------------------
-# Train
-# ----------------------------
-
 def TrainOperation(
-    TrainSamples,
-    ValSamples,
+    TrainCachedSamples,
+    ValCachedSamples,
     NumEpochs,
     MiniBatchSize,
-    SaveCheckPoint,
     CheckPointPath,
     LogsPath,
     LatestFile,
@@ -277,35 +248,33 @@ def TrainOperation(
     LR,
     Rho,
     BoundMode,
-    AlignCorners,
-    LogEvery,
-    ValEvery,
-    UsePatchNorm,
-    WeightDecay
+    MaskThresh,
+    AlignCorners
 ):
     model = Homographynet(in_channels=2).to(Device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WeightDecay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     loss_fn = PhotometricLoss()
 
     writer = SummaryWriter(LogsPath)
-
-    scaler = torch.cuda.amp.GradScaler(enabled=(Device.type == "cuda"))
 
     start_epoch = 0
     global_step = 0
     best_val = float("inf")
 
     if LatestFile is not None:
-        ckpt = torch.load(os.path.join(CheckPointPath, LatestFile), map_location=Device)
+        ckpt_path = os.path.join(CheckPointPath, LatestFile)
+        ckpt = torch.load(ckpt_path, map_location=Device)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_epoch = int(ckpt.get("epoch", 0))
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
         print("Loaded checkpoint:", LatestFile, "start_epoch:", start_epoch)
 
-    # You are printing "Number of Training Samples 50000" etc, but that is *logical* count.
-    # Actual iteration count is computed here:
-    train_iters_per_epoch = max(len(TrainSamples) // MiniBatchSize, 1)
-    val_iters = max(len(ValSamples) // MiniBatchSize, 1) if len(ValSamples) > 0 else 0
+    train_iters_per_epoch = max(len(TrainCachedSamples) // MiniBatchSize, 1)
+    val_iters = max(len(ValCachedSamples) // MiniBatchSize, 1) if len(ValCachedSamples) > 0 else 0
+
+    print(f"\nStarting training...")
+    print(f"Iterations per epoch: {train_iters_per_epoch}")
+    print(f"Validation iterations: {val_iters}\n")
 
     for epoch in range(start_epoch, NumEpochs):
         t0 = time.time()
@@ -313,78 +282,50 @@ def TrainOperation(
         running = 0.0
 
         for it in range(train_iters_per_epoch):
-            stacked, PA, PB, CA = GenerateBatch(TrainSamples, MiniBatchSize, Device)
+            stacked, PA, PB, CA = GenerateBatch(TrainCachedSamples, MiniBatchSize)
 
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.cuda.amp.autocast(enabled=(Device.type == "cuda")):
-                h4pt_hat = model(stacked)
-                h4pt_hat = bound_h4pt(h4pt_hat, Rho, BoundMode)
+            h4pt_hat = model(stacked)
+            h4pt_hat = bound_h4pt(h4pt_hat, Rho, BoundMode)
 
-                H_hat = tensor_dlt(CA, h4pt_hat)
-                PA_warp, valid_mask = apply_warp_with_mask(PA, H_hat, align_corners=AlignCorners)
+            H_hat = tensor_dlt(CA, h4pt_hat)
+            PA_warp = apply_warp(PA, H_hat, align_corners=AlignCorners)
 
-                if UsePatchNorm:
-                    PA_warp_n = normalize_patch(PA_warp)
-                    PB_n = normalize_patch(PB)
-                    loss = loss_fn(PA_warp_n, PB_n, valid_mask)
-                else:
-                    loss = loss_fn(PA_warp, PB, valid_mask)
+            ones = torch.ones_like(PA)
+            ones_warp = apply_warp(ones, H_hat, align_corners=AlignCorners)
+            valid_mask = (ones_warp > MaskThresh).float()
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            loss = loss_fn(PA_warp, PB, valid_mask)
+            loss.backward()
+            optimizer.step()
 
-            loss_val = float(loss.item())
-            running += loss_val
+            running += float(loss.item())
             global_step += 1
 
-            # TensorBoard (NO flush every iter)
-            if global_step % LogEvery == 0:
-                writer.add_scalar("LossEveryIter/train", loss_val, global_step)
-                writer.flush()
-
-            # Optional console heartbeat (helps you see it's not "stuck")
-            if it % max(50, (train_iters_per_epoch // 10)) == 0:
-                print(f"  [epoch {epoch+1:02d}] it {it:05d}/{train_iters_per_epoch:05d} loss {loss_val:.6f}")
-
-            # checkpoint every N iters (avoid it==0)
-            if SaveCheckPoint > 0 and (it % SaveCheckPoint == 0) and it != 0:
-                save_name = os.path.join(CheckPointPath, f"{epoch}a{it}model.ckpt")
-                torch.save(
-                    {
-                        "epoch": epoch,
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "loss": loss_val,
-                    },
-                    save_name
-                )
+            writer.add_scalar("LossEveryIter/train", float(loss.item()), global_step)
 
         train_loss = running / max(train_iters_per_epoch, 1)
 
-        # Validation (optionally not every epoch to save time)
-        if (epoch + 1) % ValEvery == 0 and val_iters > 0:
+        if val_iters > 0:
             val_loss = RunValidation(
-                model, ValSamples, MiniBatchSize, val_iters, loss_fn,
-                Device, Rho, BoundMode, AlignCorners, UsePatchNorm
+                model, ValCachedSamples, MiniBatchSize, val_iters, loss_fn,
+                Rho, BoundMode, MaskThresh, AlignCorners
             )
         else:
-            val_loss = float("inf") if val_iters > 0 else float("inf")
+            val_loss = float("inf")
 
-        # Epoch scalars
         writer.add_scalar("LossEveryEpoch/train", train_loss, epoch)
-        if val_iters > 0 and (epoch + 1) % ValEvery == 0:
+        if val_iters > 0:
             writer.add_scalar("LossEveryEpoch/val", val_loss, epoch)
         writer.flush()
 
         dt = time.time() - t0
-        if val_iters > 0 and (epoch + 1) % ValEvery == 0:
-            print(f"Epoch {epoch+1:03d}/{NumEpochs:03d} | train_loss: {train_loss:.6f} | val_loss: {val_loss:.6f} | time: {dt:.1f}s")
-        else:
-            print(f"Epoch {epoch+1:03d}/{NumEpochs:03d} | train_loss: {train_loss:.6f} | val_loss: (skipped) | time: {dt:.1f}s")
 
-        # Save every epoch (one file)
+        # Clean output
+        print(f"Epoch {epoch+1:03d}/{NumEpochs:03d} | train_loss: {train_loss:.6f} | val_loss: {val_loss:.6f} | time: {dt:.1f}s")
+
+        # Save every epoch (silently)
         save_name = os.path.join(CheckPointPath, f"{epoch}model.ckpt")
         torch.save(
             {
@@ -397,7 +338,7 @@ def TrainOperation(
             save_name
         )
 
-        # Save best
+        # Save best (silently)
         if val_loss < best_val:
             best_val = val_loss
             best_name = os.path.join(CheckPointPath, "best.pt")
@@ -411,40 +352,34 @@ def TrainOperation(
                 },
                 best_name
             )
-            print("  ✓ saved best.pt")
+            print(f"  ✓ saved best.pt (val_loss: {val_loss:.6f})")
+
+    writer.close()
 
 
 def main():
     data_dir, train_dir, val_dir, ckpt_dir, logs_dir = get_default_paths()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--TrainDir", default=str(train_dir), help="patch_train directory")
-    parser.add_argument("--ValDir", default=str(val_dir), help="patch_val/patch_test directory")
+    parser.add_argument("--TrainDir", default=str(train_dir))
+    parser.add_argument("--ValDir", default=str(val_dir))
+    parser.add_argument("--CheckPointPath", default=str(ckpt_dir))
+    parser.add_argument("--LogsPath", default=str(logs_dir))
 
-    parser.add_argument("--CheckPointPath", default=str(ckpt_dir), help="Path to save checkpoints")
-    parser.add_argument("--LogsPath", default=str(logs_dir), help="Path to save Tensorboard logs")
-
-    parser.add_argument("--NumEpochs", type=int, default=10)
-    parser.add_argument("--MiniBatchSize", type=int, default=32)
-
-    # Reduce checkpoint stalls by default
-    parser.add_argument("--SaveCheckPoint", type=int, default=500, help="save every N iters (0 disables)")
+    parser.add_argument("--NumEpochs", type=int, default=50)
+    parser.add_argument("--MiniBatchSize", type=int, default=64, 
+                       help="Batch size (default: 64)")
     parser.add_argument("--LoadCheckPoint", type=int, default=0)
 
-    # IMPORTANT: better LR default
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-6)
-
+    parser.add_argument("--lr", type=float, default=1e-5,
+                       help="Learning rate (default: 1e-5)")
     parser.add_argument("--rho", type=float, default=32.0)
-    parser.add_argument("--bound_mode", default="tanh", choices=["none", "clamp", "tanh"])
+    parser.add_argument("--bound_mode", default="none", choices=["none", "clamp", "tanh"],
+                       help="Bounding mode (default: none)")
+    parser.add_argument("--mask_thresh", type=float, default=0.9)
     parser.add_argument("--align_corners", action="store_true")
-
-    # Logging + val frequency
-    parser.add_argument("--log_every", type=int, default=50, help="tensorboard scalar every N steps")
-    parser.add_argument("--val_every", type=int, default=1, help="run val every N epochs (increase to speed up)")
-
-    # Helps convergence
-    parser.add_argument("--use_patch_norm", action="store_true", help="normalize PA_warp/PB per patch before loss")
+    parser.add_argument("--max_cache", type=int, default=10000,
+                       help="Max samples to cache in memory (default: 10000)")
 
     args = parser.parse_args()
 
@@ -456,42 +391,43 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # List all samples
+    print("[INFO] Discovering samples...")
     train_samples = list_samples(train_dir)
     val_samples = list_samples(val_dir) if val_dir.exists() else []
+
+    if len(train_samples) == 0:
+        raise RuntimeError(f"No training samples found in: {train_dir}")
 
     latest = FindLatestModel(args.CheckPointPath) if args.LoadCheckPoint == 1 else None
 
     PrettyPrint(args.NumEpochs, args.MiniBatchSize, len(train_samples), len(val_samples), latest)
     print("Device:", device)
-    print("rho:", args.rho, "bound_mode:", args.bound_mode, "align_corners:", args.align_corners)
+    print(f"LR: {args.lr}, bound_mode: {args.bound_mode}, mask_thresh: {args.mask_thresh}, align_corners: {args.align_corners}")
     print("TrainDir:", train_dir)
     print("ValDir:", val_dir)
-    print("LR:", args.lr, "weight_decay:", args.weight_decay, "use_patch_norm:", args.use_patch_norm)
 
-    if len(train_samples) == 0:
-        raise RuntimeError(
-            f"No training samples found in: {train_dir}\n"
-            f"Expected files like: 1_PA.png, 1_PB.png, 1_meta.npz"
-        )
+    # PRE-LOAD samples into memory
+    train_cached = preload_samples(train_samples, device, max_cache=args.max_cache)
+    val_cached = preload_samples(val_samples, device, max_cache=min(2000, len(val_samples))) if val_samples else []
+
+    print(f"\n[INFO] Cached {len(train_cached)} training samples")
+    print(f"[INFO] Cached {len(val_cached)} validation samples")
 
     TrainOperation(
-        TrainSamples=train_samples,
-        ValSamples=val_samples,
+        TrainCachedSamples=train_cached,
+        ValCachedSamples=val_cached,
         NumEpochs=args.NumEpochs,
         MiniBatchSize=args.MiniBatchSize,
-        SaveCheckPoint=args.SaveCheckPoint,
-        CheckPointPath=args.CheckPointPath if args.CheckPointPath.endswith(os.sep) else args.CheckPointPath + os.sep,
+        CheckPointPath=args.CheckPointPath,
         LogsPath=args.LogsPath,
         LatestFile=latest,
         Device=device,
         LR=args.lr,
         Rho=args.rho,
         BoundMode=args.bound_mode,
+        MaskThresh=args.mask_thresh,
         AlignCorners=args.align_corners,
-        LogEvery=max(1, args.log_every),
-        ValEvery=max(1, args.val_every),
-        UsePatchNorm=args.use_patch_norm,
-        WeightDecay=args.weight_decay,
     )
 
 
