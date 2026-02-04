@@ -327,3 +327,8 @@ python3 -m Unsupervised_learning.visualize_debug \
 **Implementation Date:** February 2026  
 **Best Model:** Epoch 43  
 **Final MAE:** 17.36 pixels
+
+
+
+## Issues with blending 
+ Due to the 17px error in the unsupervised learning, the images are not alligned perfectly => this is the reason the artifcats exist even after blending 
