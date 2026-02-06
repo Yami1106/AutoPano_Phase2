@@ -27,24 +27,13 @@ sys.dont_write_bytecode = True
 # Smart import: works from both Code/ and Code/Unsupervised_learning/
 try:
     # Try importing as if we're in Code/ directory
-    from Unsupervised_learning.model import Homographynet
+    from Unsupervised_learning.model import HomographyNet
 except ModuleNotFoundError:
     # We're in Unsupervised_learning/ directory, import directly
-    from model import Homographynet
+    from model import HomographyNet
 
 
 def SetupAll(BasePath):
-    """
-    Setup parameters and paths
-    
-    Inputs:
-    BasePath - Path to test images
-    
-    Outputs:
-    ImageSize - Size of patch used during training
-    TestImagePaths - List of paths to test images
-    """
-    # Image patch size used during training
     PatchSize = 128
     ImageSize = [PatchSize, PatchSize, 1]  # Grayscale
     
@@ -64,17 +53,6 @@ def SetupAll(BasePath):
 
 
 def ReadAndPreprocessImage(ImagePath, PatchSize=128):
-    """
-    Read image and convert to grayscale
-    
-    Inputs:
-    ImagePath - Path to image
-    PatchSize - Size of patch to extract
-    
-    Outputs:
-    Image - Original image
-    ImageGray - Grayscale image
-    """
     Image = cv2.imread(ImagePath)
     if Image is None:
         print(f"ERROR: Cannot read image {ImagePath}")
@@ -86,17 +64,6 @@ def ReadAndPreprocessImage(ImagePath, PatchSize=128):
 
 
 def ExtractCenterPatch(Image, PatchSize=128):
-    """
-    Extract center patch from image
-    
-    Inputs:
-    Image - Input image
-    PatchSize - Size of patch to extract
-    
-    Outputs:
-    Patch - Extracted patch
-    TopLeft - Top left coordinate of patch (for visualization)
-    """
     H, W = Image.shape[:2]
     
     # Calculate center
@@ -121,21 +88,6 @@ def ExtractCenterPatch(Image, PatchSize=128):
 
 
 def GenerateSyntheticPair(ImageGray, PatchSize=128, Rho=32):
-    """
-    Generate synthetic patch pair with known homography for testing
-    (Same as training data generation)
-    
-    Inputs:
-    ImageGray - Grayscale image
-    PatchSize - Size of patches
-    Rho - Maximum perturbation
-    
-    Outputs:
-    PA - Patch A
-    PB - Patch B  
-    H4Pt_GT - Ground truth H4Pt
-    CA - Corners of patch A
-    """
     H, W = ImageGray.shape
     
     # Ensure we can extract patch after perturbation
@@ -183,16 +135,6 @@ def GenerateSyntheticPair(ImageGray, PatchSize=128, Rho=32):
 
 
 def ComputeEPE(H4Pt_pred, H4Pt_GT):
-    """
-    Compute End-Point Error (EPE)
-    
-    Inputs:
-    H4Pt_pred - Predicted H4Pt (8,)
-    H4Pt_GT - Ground truth H4Pt (8,)
-    
-    Outputs:
-    EPE - Average L2 error across 4 corner points
-    """
     # Reshape to (4, 2) for easier computation
     pred_corners = H4Pt_pred.reshape(4, 2)
     gt_corners = H4Pt_GT.reshape(4, 2)
@@ -207,18 +149,6 @@ def ComputeEPE(H4Pt_pred, H4Pt_GT):
 
 
 def TestOperation(ImageSize, ModelPath, TestImagePaths, NumTestsPerImage=10):
-    """
-    Test the trained model
-    
-    Inputs:
-    ImageSize - Size of the image patch
-    ModelPath - Path to trained model checkpoint
-    TestImagePaths - List of test image paths
-    NumTestsPerImage - Number of synthetic pairs to generate per image
-    
-    Outputs:
-    Prints EPE statistics and saves results
-    """
     PatchSize = ImageSize[0]
     
     # Check if CUDA is available
@@ -227,7 +157,7 @@ def TestOperation(ImageSize, ModelPath, TestImagePaths, NumTestsPerImage=10):
     
     # Load model
     print(f"Loading model from {ModelPath}")
-    model = Homographynet()
+    model = HomographyNet()
     model = model.to(Device)
     
     CheckPoint = torch.load(ModelPath, map_location=Device)
@@ -362,7 +292,7 @@ def main():
     Parser.add_argument(
         '--BasePath',
         dest='BasePath',
-        default='/home/yami/Documents/Group9_p1/Phase2/Data/Phase2',
+        default='../Data/Phase2',
         help='Path to test images, Default: ../Data/Phase2'
     )
     Parser.add_argument(
@@ -376,13 +306,12 @@ def main():
     ModelType = Args.ModelType
     BasePath = Args.BasePath
     NumTestsPerImage = Args.NumTestsPerImage
-    
-    # Set default model path if not provided
+
     if Args.ModelPath is None:
         if ModelType == 'unsupervised':
-            ModelPath = '/home/yami/Documents/Group9_p1/Phase2/Checkpoints/unsup/best.pt'
+            ModelPath = '../Checkpoints/unsup/best.pt'
         else:
-            ModelPath = '/home/yami/Documents/Group9_p1/Phase2/Checkpoints/sup/best.pt'
+            ModelPath = '../Checkpoints/sup/best.pt'
     else:
         ModelPath = Args.ModelPath
     

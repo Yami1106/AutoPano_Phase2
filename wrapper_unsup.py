@@ -12,9 +12,9 @@ Worcester Polytechnic Institute
 Panorama stitching using:
 - Shi-Tomasi corner detection
 - Feature descriptors (ORB/SIFT)
-- Feature matching
+- Custom SSD-based feature matching with ratio test
 - Deep learning homography estimation (best.pt)
-- Poisson blending
+- Feathered blending
 """
 
 import argparse
@@ -30,20 +30,8 @@ from Unsupervised_learning.model import Homographynet
 from Unsupervised_learning.tensordlt import tensor_dlt
 
 
-# ========================
 # 1. IMAGE LOADING
-# ========================
-
 def read_images(image_path: str) -> List[np.ndarray]:
-    """
-    Read all images from the given path.
-    
-    Args:
-        image_path: Path to folder containing images or pattern (e.g., "images/*.jpg")
-    
-    Returns:
-        List of images in BGR format
-    """
     if Path(image_path).is_dir():
         pattern = str(Path(image_path) / "*.jpg")
         img_files = sorted(glob.glob(pattern))
@@ -67,25 +55,10 @@ def read_images(image_path: str) -> List[np.ndarray]:
     
     return images
 
-
-# ========================
 # 2. SHI-TOMASI CORNER DETECTION
-# ========================
 
 def detect_shi_tomasi_corners(image: np.ndarray, max_corners: int = 1000, 
                                quality_level: float = 0.01, min_distance: int = 10) -> np.ndarray:
-    """
-    Detect Shi-Tomasi corners using cv2.goodFeaturesToTrack.
-    
-    Args:
-        image: Input image (BGR)
-        max_corners: Maximum number of corners to detect
-        quality_level: Quality level (0-1)
-        min_distance: Minimum distance between corners
-    
-    Returns:
-        corners: Nx2 array of corner coordinates (x, y)
-    """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
     corners = cv2.goodFeaturesToTrack(
@@ -103,104 +76,107 @@ def detect_shi_tomasi_corners(image: np.ndarray, max_corners: int = 1000,
     corners = corners.reshape(-1, 2)
     return corners
 
-
-# ========================
-# 3. FEATURE DESCRIPTORS
-# ========================
+# 3. FEATURE DESCRIPTORS 
 
 def compute_descriptors(image: np.ndarray, keypoints: np.ndarray, 
-                        method: str = "ORB") -> Tuple[List, np.ndarray]:
-    """
-    Compute feature descriptors around detected keypoints.
+                        patch_size: int = 40, output_size: int = 8) -> Tuple[List, np.ndarray]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
     
-    Args:
-        image: Input image (BGR)
-        keypoints: Nx2 array of keypoint coordinates
-        method: Descriptor type ("ORB" or "SIFT")
+    half_patch = patch_size // 2
     
-    Returns:
-        cv_keypoints: List of cv2.KeyPoint objects
-        descriptors: NxD descriptor array
-    """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # Add padding to handle features near boundaries
+    padded = cv2.copyMakeBorder(
+        gray, 
+        half_patch, half_patch, half_patch, half_patch, 
+        cv2.BORDER_REFLECT
+    )
     
-    # Convert numpy keypoints to cv2.KeyPoint objects
-    cv_keypoints = [cv2.KeyPoint(x=float(pt[0]), y=float(pt[1]), size=20) for pt in keypoints]
+    descriptors = []
+    valid_keypoints = []
     
-    if method.upper() == "ORB":
-        descriptor = cv2.ORB_create(nfeatures=len(cv_keypoints))
-    elif method.upper() == "SIFT":
-        descriptor = cv2.SIFT_create(nfeatures=len(cv_keypoints))
-    else:
-        raise ValueError(f"Unknown descriptor method: {method}")
+    for pt in keypoints:
+        x, y = int(pt[0]), int(pt[1])
+        
+        # Offset coordinates for padding
+        x_pad, y_pad = x + half_patch, y + half_patch
+        
+        patch = padded[
+            y_pad - half_patch : y_pad + half_patch + 1,
+            x_pad - half_patch : x_pad + half_patch + 1
+        ]
+        
+        # Apply Gaussian blur 
+        blurred_patch = cv2.GaussianBlur(patch, (5, 5), 0)
+        
+        subsampled = cv2.resize(
+            blurred_patch, 
+            (output_size, output_size), 
+            interpolation=cv2.INTER_LINEAR
+        )
+        
+        feature_vec = subsampled.reshape(-1)
+        
+        mean = np.mean(feature_vec)
+        std = np.std(feature_vec)
+        feature_vec = (feature_vec - mean) / (std + 1e-7)
+        
+        descriptors.append(feature_vec)
+        valid_keypoints.append(pt)
     
-    # Compute descriptors
-    cv_keypoints, descriptors = descriptor.compute(gray, cv_keypoints)
+    descriptors = np.array(descriptors, dtype=np.float32)
+    
+    cv_keypoints = [
+        cv2.KeyPoint(x=float(pt[0]), y=float(pt[1]), size=20) 
+        for pt in valid_keypoints
+    ]
     
     return cv_keypoints, descriptors
 
-
-# ========================
 # 4. FEATURE MATCHING
-# ========================
 
 def match_features(desc1: np.ndarray, desc2: np.ndarray, 
-                   ratio_thresh: float = 0.75) -> List[cv2.DMatch]:
-    """
-    Match features using FLANN or BFMatcher with ratio test.
+                   ratio_thresh: float = 0.75) -> List[Tuple[int, int, float]]:
+    # Flatten descriptors to ensure they are 2D arrays
+    desc1 = desc1.reshape(desc1.shape[0], -1).astype(np.float32)
+    desc2 = desc2.reshape(desc2.shape[0], -1).astype(np.float32)
     
-    Args:
-        desc1: Descriptors from image 1
-        desc2: Descriptors from image 2
-        ratio_thresh: Lowe's ratio test threshold
+    matches = []
     
-    Returns:
-        good_matches: List of good matches
-    """
-    # Use FLANN for SIFT, BFMatcher for ORB
-    if desc1.dtype == np.float32:
-        # FLANN for SIFT
-        FLANN_INDEX_KDTREE = 1
-        index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-        search_params = dict(checks=50)
-        matcher = cv2.FlannBasedMatcher(index_params, search_params)
-    else:
-        # BFMatcher for ORB
-        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    # For each descriptor in image 1, find best and second-best match in image 2
+    for i in range(len(desc1)):
+        # Compute Sum of Squared Differences (SSD) to all descriptors in desc2
+        diff = desc1[i] - desc2
+        ssd = np.sum(diff**2, axis=1)
+        
+        # Find two best matches (lowest SSD)
+        sorted_indices = np.argsort(ssd)
+        
+        if len(sorted_indices) < 2:
+            continue
+        
+        best_idx = sorted_indices[0]
+        second_best_idx = sorted_indices[1]
+        
+        best_ssd = ssd[best_idx]
+        second_best_ssd = ssd[second_best_idx]
+        
+        # Apply Lowe's ratio test
+        # Accept match only if best SSD is significantly lower than second best
+        # rejects ambiguous matches in repetitive patterns
+        if best_ssd < ratio_thresh * second_best_ssd:
+            matches.append((i, best_idx, float(best_ssd)))
     
-    # KNN matching
-    matches = matcher.knnMatch(desc1, desc2, k=2)
-    
-    # Apply Lowe's ratio test
-    good_matches = []
-    for match_pair in matches:
-        if len(match_pair) == 2:
-            m, n = match_pair
-            if m.distance < ratio_thresh * n.distance:
-                good_matches.append(m)
-    
-    return good_matches
+    return matches
 
 
-def get_matched_points(kp1: List, kp2: List, matches: List[cv2.DMatch]) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Extract matched point coordinates from keypoints and matches.
-    
-    Returns:
-        pts1: Nx2 array of points in image 1
-        pts2: Nx2 array of corresponding points in image 2
-    """
-    pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
-    pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
+def get_matched_points(kp1: List, kp2: List, matches: List[Tuple[int, int, float]]) -> Tuple[np.ndarray, np.ndarray]:
+    pts1 = np.float32([kp1[m[0]].pt for m in matches])
+    pts2 = np.float32([kp2[m[1]].pt for m in matches])
     return pts1, pts2
 
-
-# ========================
 # 5. DEEP LEARNING HOMOGRAPHY ESTIMATION
-# ========================
 
 class HomographyEstimator:
-    """Homography estimator using trained deep learning model."""
     
     def __init__(self, model_path: str, device: str = "cuda"):
         """
@@ -237,7 +213,7 @@ class HomographyEstimator:
             num_samples: Number of matches to sample for averaging
         
         Returns:
-            H: 3x3 homography matrix (maps img1 -> img2)
+            H: 3x3 homography matrix (maps img2 -> img1)
         """
         # Sample multiple matches and average their homography predictions
         num_samples = min(num_samples, len(pts1))
@@ -305,7 +281,6 @@ class HomographyEstimator:
     def _predict_homography_from_patches(self, PA: np.ndarray, PB: np.ndarray,
                                          pt1: np.ndarray, pt2: np.ndarray,
                                          patch_size: int) -> Optional[np.ndarray]:
-        """Predict homography from patch pair."""
         with torch.no_grad():
             # Normalize patches
             PA_norm = PA.astype(np.float32) / 255.0
@@ -330,8 +305,6 @@ class HomographyEstimator:
             H_patch = tensor_dlt(CA, h4pt)  # (1, 3, 3)
             H_patch = H_patch[0].cpu().numpy()  # (3, 3)
             
-            # Convert patch-level homography to image-level homography
-            # Shift to account for patch location
             half_size = patch_size // 2
             
             # Translation matrices
@@ -352,22 +325,11 @@ class HomographyEstimator:
             
             return H_image
 
-
-# ========================
-# 6. PANORAMA STITCHING
-# ========================
+# 6. STITCHING WITH FEATHERED BLENDING
 
 def estimate_panorama_order(images: List[np.ndarray], matcher_params: Dict) -> List[int]:
-    """
-    Estimate the order of images for panorama stitching.
-    Uses feature matching to find adjacent images.
-    
-    Returns:
-        order: List of indices representing stitching order
-    """
     n = len(images)
     
-    # Compute all pairwise matches
     match_counts = np.zeros((n, n), dtype=int)
     
     for i in range(n):
@@ -376,11 +338,10 @@ def estimate_panorama_order(images: List[np.ndarray], matcher_params: Dict) -> L
             corners_i = detect_shi_tomasi_corners(images[i], max_corners=matcher_params['max_corners'])
             corners_j = detect_shi_tomasi_corners(images[j], max_corners=matcher_params['max_corners'])
             
-            # Compute descriptors
-            kp_i, desc_i = compute_descriptors(images[i], corners_i, method=matcher_params['descriptor'])
-            kp_j, desc_j = compute_descriptors(images[j], corners_j, method=matcher_params['descriptor'])
+            kp_i, desc_i = compute_descriptors(images[i], corners_i)
+            kp_j, desc_j = compute_descriptors(images[j], corners_j)
             
-            # Match
+            # Match (SSD-based matching)
             matches = match_features(desc_i, desc_j, ratio_thresh=matcher_params['ratio_thresh'])
             
             match_counts[i, j] = len(matches)
@@ -388,7 +349,7 @@ def estimate_panorama_order(images: List[np.ndarray], matcher_params: Dict) -> L
             
             print(f"Image {i} <-> Image {j}: {len(matches)} matches")
     
-    # Find stitching order using greedy approach
+    # Find stitching order
     # Start with the image that has most total matches
     total_matches = match_counts.sum(axis=1)
     current = np.argmax(total_matches)
@@ -422,17 +383,6 @@ def estimate_panorama_order(images: List[np.ndarray], matcher_params: Dict) -> L
 
 
 def stitch_image_pair(img1: np.ndarray, img2: np.ndarray, H: np.ndarray) -> np.ndarray:
-    """
-    Stitch two images using the given homography.
-    
-    Args:
-        img1: Base image
-        img2: Image to warp onto img1
-        H: Homography matrix (maps img2 -> img1)
-    
-    Returns:
-        panorama: Stitched result
-    """
     h1, w1 = img1.shape[:2]
     h2, w2 = img2.shape[:2]
     
@@ -471,101 +421,67 @@ def stitch_image_pair(img1: np.ndarray, img2: np.ndarray, H: np.ndarray) -> np.n
     
     img2_warped = cv2.warpPerspective(img2, H_adjusted, (out_w, out_h))
     
-    # Place img1
-    panorama = img2_warped.copy()
+    # Calculate where img1 goes
     x_offset = -min_x
     y_offset = -min_y
     
-    panorama[y_offset:y_offset + h1, x_offset:x_offset + w1] = img1
+    # Create masks
+    gray2 = cv2.cvtColor(img2_warped, cv2.COLOR_BGR2GRAY)
+    mask2 = (gray2 > 10).astype(np.float32)
+    
+    mask1 = np.zeros((out_h, out_w), dtype=np.float32)
+    mask1[y_offset:y_offset + h1, x_offset:x_offset + w1] = 1.0
+    
+    # Find overlap
+    overlap = (mask1 > 0) & (mask2 > 0)
+    
+    if overlap.sum() > 100:
+        feather_width = 30
+        
+        dist1 = cv2.distanceTransform((mask1 * 255).astype(np.uint8), cv2.DIST_L2, 5)
+        dist1 = np.clip(dist1 / feather_width, 0, 1)
+        
+        # Create weight mask
+        weight1 = dist1.copy()
+        weight2 = 1.0 - weight1
+        
+        # Apply weights only in overlap region
+        weight1 = weight1 * overlap
+        weight2 = weight2 * overlap
+        
+        # Normalize weights in overlap
+        total_weight = weight1 + weight2
+        total_weight[total_weight == 0] = 1
+        weight1 = weight1 / total_weight
+        weight2 = weight2 / total_weight
+        
+        panorama = img2_warped.copy()
+        
+        # Place img1 in non-overlap regions
+        non_overlap_img1 = (mask1 > 0) & ~overlap
+        img1_canvas = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+        img1_canvas[y_offset:y_offset + h1, x_offset:x_offset + w1] = img1
+        panorama[non_overlap_img1] = img1_canvas[non_overlap_img1]
+        
+        # Blend in overlap region
+        for c in range(3):
+            panorama[overlap, c] = (
+                img1_canvas[overlap, c] * weight1[overlap] +
+                img2_warped[overlap, c] * weight2[overlap]
+            ).astype(np.uint8)
+        
+        print(f"  Feathered blend: {overlap.sum()} overlap pixels")
+    else:
+        # No overlap - simple placement
+        panorama = img2_warped.copy()
+        panorama[y_offset:y_offset + h1, x_offset:x_offset + w1] = img1
+        print("  No overlap - direct placement")
     
     return panorama
 
 
-# ========================
-# 7. POISSON BLENDING
-# ========================
-
-def create_blend_mask(img1: np.ndarray, img2_warped: np.ndarray, 
-                      x_offset: int, y_offset: int) -> np.ndarray:
-    """
-    Create a mask for blending region.
-    
-    Returns:
-        mask: Binary mask (255 where img2 should dominate)
-    """
-    h1, w1 = img1.shape[:2]
-    h2, w2 = img2_warped.shape[:2]
-    
-    mask = np.zeros((h2, w2), dtype=np.uint8)
-    
-    # Create mask where img2 has content
-    gray2 = cv2.cvtColor(img2_warped, cv2.COLOR_BGR2GRAY) if img2_warped.ndim == 3 else img2_warped
-    mask[gray2 > 0] = 255
-    
-    # Exclude region where img1 will be placed
-    mask[y_offset:y_offset + h1, x_offset:x_offset + w1] = 0
-    
-    return mask
-
-
-def poisson_blend_panorama(panorama: np.ndarray, img1: np.ndarray, 
-                           x_offset: int, y_offset: int) -> np.ndarray:
-    """
-    Apply Poisson blending to seamlessly blend img1 into panorama.
-    
-    Args:
-        panorama: Background panorama
-        img1: Image to blend in
-        x_offset, y_offset: Position of img1 in panorama
-    
-    Returns:
-        blended: Blended result
-    """
-    h1, w1 = img1.shape[:2]
-    
-    # Create mask for img1
-    mask = np.ones((h1, w1), dtype=np.uint8) * 255
-    
-    # Erode mask slightly to avoid edge artifacts
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.erode(mask, kernel, iterations=2)
-    
-    # Center point for blending
-    center = (x_offset + w1 // 2, y_offset + h1 // 2)
-    
-    try:
-        # Poisson blending
-        blended = cv2.seamlessClone(
-            img1, 
-            panorama, 
-            mask, 
-            center, 
-            cv2.NORMAL_CLONE
-        )
-        return blended
-    except cv2.error as e:
-        print(f"Poisson blending failed: {e}")
-        print("Falling back to simple overlay")
-        # Fallback to simple overlay
-        result = panorama.copy()
-        result[y_offset:y_offset + h1, x_offset:x_offset + w1] = img1
-        return result
-
-
 def create_panorama(images: List[np.ndarray], estimator: HomographyEstimator,
-                   matcher_params: Dict, use_poisson: bool = True) -> np.ndarray:
-    """
-    Create panorama from multiple images.
-    
-    Args:
-        images: List of input images
-        estimator: HomographyEstimator instance
-        matcher_params: Parameters for feature matching
-        use_poisson: Whether to use Poisson blending
-    
-    Returns:
-        panorama: Final stitched panorama
-    """
+                   matcher_params: Dict) -> np.ndarray:
     if len(images) == 0:
         raise ValueError("No images provided")
     
@@ -589,11 +505,11 @@ def create_panorama(images: List[np.ndarray], estimator: HomographyEstimator,
         corners_pano = detect_shi_tomasi_corners(panorama, max_corners=matcher_params['max_corners'])
         corners_next = detect_shi_tomasi_corners(img_next, max_corners=matcher_params['max_corners'])
         
-        # Compute descriptors
-        kp_pano, desc_pano = compute_descriptors(panorama, corners_pano, method=matcher_params['descriptor'])
-        kp_next, desc_next = compute_descriptors(img_next, corners_next, method=matcher_params['descriptor'])
+        # Compute descriptors 
+        kp_pano, desc_pano = compute_descriptors(panorama, corners_pano)
+        kp_next, desc_next = compute_descriptors(img_next, corners_next)
         
-        # Match features
+        # Match features 
         matches = match_features(desc_pano, desc_next, ratio_thresh=matcher_params['ratio_thresh'])
         
         if len(matches) < 4:
@@ -606,17 +522,12 @@ def create_panorama(images: List[np.ndarray], estimator: HomographyEstimator,
         # Estimate homography using deep learning
         H = estimator.estimate_homography(panorama, img_next, pts_pano, pts_next)
         
-        # Stitch
+        # Stitch with feathered blending
         panorama = stitch_image_pair(panorama, img_next, H)
         
         print(f"Panorama size: {panorama.shape}")
     
     return panorama
-
-
-# ========================
-# MAIN
-# ========================
 
 def main():
     # Command line arguments
@@ -627,14 +538,10 @@ def main():
                        help='Path to best.pt checkpoint')
     parser.add_argument('--NumFeatures', type=int, default=1000,
                        help='Maximum number of corners to detect (default: 1000)')
-    parser.add_argument('--Descriptor', type=str, default='ORB', choices=['ORB', 'SIFT'],
-                       help='Feature descriptor type (default: ORB)')
     parser.add_argument('--RatioThresh', type=float, default=0.75,
                        help='Lowe\'s ratio test threshold (default: 0.75)')
     parser.add_argument('--OutputPath', type=str, default='mypano.png',
                        help='Output panorama path (default: mypano.png)')
-    parser.add_argument('--UsePoisson', action='store_true',
-                       help='Use Poisson blending (experimental)')
     parser.add_argument('--Device', type=str, default='cuda', choices=['cuda', 'cpu'],
                        help='Device for model inference (default: cuda)')
     
@@ -645,47 +552,47 @@ def main():
     print("=" * 80)
     
     # Read images
-    print("\n[1/7] Reading images...")
+    print("\n[1/6] Reading images...")
     images = read_images(args.ImagePath)
     print(f"Loaded {len(images)} images")
     
     # Initialize homography estimator
-    print("\n[2/7] Loading deep learning model...")
+    print("\n[2/6] Loading deep learning model...")
     estimator = HomographyEstimator(args.ModelPath, device=args.Device)
     
     # Matcher parameters
     matcher_params = {
         'max_corners': args.NumFeatures,
-        'descriptor': args.Descriptor,
         'ratio_thresh': args.RatioThresh,
     }
     
-    print(f"\n[3/7] Feature detection parameters:")
+    print(f"\n[3/6] Feature detection parameters:")
     print(f"  - Max corners: {matcher_params['max_corners']}")
-    print(f"  - Descriptor: {matcher_params['descriptor']}")
+    print(f"  - Descriptor: Custom patch-based (40x40 -> 8x8)")
     print(f"  - Ratio threshold: {matcher_params['ratio_thresh']}")
+    print(f"  - Matching: Custom SSD with Lowe's ratio test")
     
     # Create panorama
-    print("\n[4/7] Creating panorama...")
-    panorama = create_panorama(images, estimator, matcher_params, use_poisson=args.UsePoisson)
+    print("\n[4/6] Creating panorama...")
+    panorama = create_panorama(images, estimator, matcher_params)
     
     # Save result
-    print("\n[5/7] Saving panorama...")
+    print("\n[5/6] Saving panorama...")
     cv2.imwrite(args.OutputPath, panorama)
     print(f"Saved: {args.OutputPath}")
     print(f"Panorama size: {panorama.shape}")
     
-    print("\n[6/7] Displaying result...")
-    # Display (optional - can comment out for headless systems)
+    print("\n[6/6] Creating preview...")
     plt.figure(figsize=(20, 10))
     plt.imshow(cv2.cvtColor(panorama, cv2.COLOR_BGR2RGB))
-    plt.title('Panorama Result')
+    plt.title('Panorama Result (Deep Learning + Custom Matching)')
     plt.axis('off')
     plt.tight_layout()
-    plt.savefig(args.OutputPath.replace('.png', '_preview.png'), dpi=150, bbox_inches='tight')
-    print(f"Saved preview: {args.OutputPath.replace('.png', '_preview.png')}")
+    preview_path = args.OutputPath.replace('.png', '_preview.png')
+    plt.savefig(preview_path, dpi=150, bbox_inches='tight')
+    print(f"Saved preview: {preview_path}")
     
-    print("\n[7/7] Done!")
+    print("\nDone!")
     print("=" * 80)
 
 
